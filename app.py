@@ -193,8 +193,11 @@ def dotplot_fig(genes, groupby, mark_a=(), mark_b=()):
     ))
     fig.update_layout(
         height=max(360, 22 * len(genes) + 160), margin=dict(l=10, r=10, t=30, b=10),
-        xaxis=dict(tickangle=-60, showgrid=False, categoryorder="array", categoryarray=xlabels),
-        yaxis=dict(autorange="reversed", showgrid=False, categoryorder="array", categoryarray=genes),
+        dragmode=False,
+        xaxis=dict(type="category", tickmode="array", tickvals=xlabels, ticktext=xlabels, tickangle=-60,
+                   showgrid=False, categoryorder="array", categoryarray=xlabels, fixedrange=True),
+        yaxis=dict(type="category", tickmode="array", tickvals=genes, ticktext=genes, autorange="reversed",
+                   showgrid=False, categoryorder="array", categoryarray=genes, fixedrange=True),
         title=dict(text="Dot size = % of cells detected · color = mean expression scaled per gene",
                    x=0.01, font=dict(size=13)),
     )
@@ -206,14 +209,19 @@ def heatmap_fig(genes, groupby, mark_a=(), mark_b=()):
     mean_log = s["sum_log"][genes].div(s["n"], axis=0)
     z = (mean_log - mean_log.mean()) / mean_log.std().replace(0, 1)
     tag = lambda g: f"{g} (A)" if g in mark_a else (f"{g} (B)" if g in mark_b else str(g))
+    xlabels = [tag(g) for g in z.index]
     fig = go.Figure(go.Heatmap(
-        z=z.T.to_numpy(), x=[tag(g) for g in z.index], y=genes, colorscale=DIVERGING, zmid=0,
+        z=z.T.to_numpy(), x=xlabels, y=genes, colorscale=DIVERGING, zmid=0,
         xgap=1, ygap=1, colorbar=dict(title="z-score", thickness=10, len=0.6),
         hovertemplate="%{y} in %{x}<br>z = %{z:.2f}<extra></extra>",
     ))
     fig.update_layout(
         height=max(360, 22 * len(genes) + 160), margin=dict(l=10, r=10, t=30, b=10),
-        yaxis=dict(autorange="reversed"), xaxis=dict(tickangle=-60),
+        dragmode=False,
+        yaxis=dict(type="category", tickmode="array", tickvals=genes, ticktext=genes,
+                   autorange="reversed", fixedrange=True),
+        xaxis=dict(type="category", tickmode="array", tickvals=xlabels, ticktext=xlabels,
+                   tickangle=-60, fixedrange=True),
         title=dict(text="Group mean expression, z-scored per gene", x=0.01, font=dict(size=13)),
     )
     return fig
