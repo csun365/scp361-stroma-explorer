@@ -179,21 +179,22 @@ def dotplot_fig(genes, groupby, mark_a=(), mark_b=()):
     pct = s["n_detected"][genes].div(s["n"], axis=0) * 100
     scaled = (mean_log - mean_log.min()) / (mean_log.max() - mean_log.min()).replace(0, 1)
     tag = lambda g: f"{g} (A)" if g in mark_a else (f"{g} (B)" if g in mark_b else str(g))
-    ylabels = [tag(g) for g in groups]
-    gx, gy = np.meshgrid(genes, ylabels)
-    sizes = pct.to_numpy()
+    xlabels = [tag(g) for g in groups]
+    gx, gy = np.meshgrid(xlabels, genes)
+    sizes = pct.T.to_numpy()
     fig = go.Figure(go.Scatter(
         x=gx.ravel(), y=gy.ravel(), mode="markers",
-        marker=dict(size=3 + sizes.ravel() * 0.22, color=scaled.to_numpy().ravel(), colorscale=SEQ,
+        marker=dict(size=3 + sizes.ravel() * 0.22, color=scaled.T.to_numpy().ravel(), colorscale=SEQ,
                     cmin=0, cmax=1, line=dict(width=0.5, color="rgba(0,0,0,0.25)"),
                     colorbar=dict(title="scaled<br>mean", thickness=10, len=0.6)),
-        customdata=np.stack([mean_log.to_numpy().ravel(), sizes.ravel()], axis=1),
-        hovertemplate="%{x} in %{y}<br>mean log expr %{customdata[0]:.2f}<br>"
+        customdata=np.stack([mean_log.T.to_numpy().ravel(), sizes.ravel()], axis=1),
+        hovertemplate="%{y} in %{x}<br>mean log expr %{customdata[0]:.2f}<br>"
                       "detected %{customdata[1]:.1f}%<extra></extra>",
     ))
     fig.update_layout(
-        height=max(320, 24 * len(groups) + 140), margin=dict(l=10, r=10, t=30, b=10),
-        xaxis=dict(tickangle=-60, showgrid=False), yaxis=dict(autorange="reversed", showgrid=False),
+        height=max(360, 22 * len(genes) + 160), margin=dict(l=10, r=10, t=30, b=10),
+        xaxis=dict(tickangle=-60, showgrid=False, categoryorder="array", categoryarray=xlabels),
+        yaxis=dict(autorange="reversed", showgrid=False, categoryorder="array", categoryarray=genes),
         title=dict(text="Dot size = % of cells detected · color = mean expression scaled per gene",
                    x=0.01, font=dict(size=13)),
     )
@@ -211,7 +212,7 @@ def heatmap_fig(genes, groupby, mark_a=(), mark_b=()):
         hovertemplate="%{y} in %{x}<br>z = %{z:.2f}<extra></extra>",
     ))
     fig.update_layout(
-        height=max(360, 16 * len(genes) + 120), margin=dict(l=10, r=10, t=30, b=10),
+        height=max(360, 22 * len(genes) + 160), margin=dict(l=10, r=10, t=30, b=10),
         yaxis=dict(autorange="reversed"), xaxis=dict(tickangle=-60),
         title=dict(text="Group mean expression, z-scored per gene", x=0.01, font=dict(size=13)),
     )
