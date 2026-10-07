@@ -312,15 +312,15 @@ with tab_genes:
         f"Highlight up to {len(SERIES)} groups (others shown in gray, all are labeled)",
         all_groups, default=all_groups[: len(SERIES)], max_selections=len(SERIES), key=f"hl_{ds}_{groupby}",
     )
-    st.plotly_chart(cluster_fig(xy, labels, highlight, point_size), width="stretch")
+    st.plotly_chart(cluster_fig(xy, labels, highlight, point_size), width="stretch", key="explorer_groups")
 
     if genes:
         cols = st.columns(2)
         for i, g in enumerate(genes):
             with cols[i % 2]:
-                st.plotly_chart(gene_fig(ds, xy, g, labels, point_size), width="stretch")
+                st.plotly_chart(gene_fig(ds, xy, g, labels, point_size), width="stretch", key=f"explorer_gene_{g}")
         st.subheader(f"Expression by {groupby.lower()}")
-        st.plotly_chart(dotplot_fig(ds, genes, groupby), width="stretch")
+        st.plotly_chart(dotplot_fig(ds, genes, groupby), width="stretch", key="explorer_dotplot")
     else:
         st.info("Pick or paste genes to plot their expression.")
 
@@ -405,7 +405,7 @@ with tab_de:
 
         v1, v2 = st.columns([3, 2])
         with v1:
-            st.plotly_chart(volcano_fig(df, up, down, padj_max, lfc_min, top[:10]), width="stretch")
+            st.plotly_chart(volcano_fig(df, up, down, padj_max, lfc_min, top[:10]), width="stretch", key="de_volcano")
         with v2:
             st.markdown(f"**Top genes** · ranked by {rank_label.lower()}")
             st.dataframe(
@@ -434,18 +434,18 @@ with tab_de:
             st.subheader("Top genes across all groups")
             p1, p2 = st.columns(2)
             with p1:
-                st.plotly_chart(dotplot_fig(ds, top, de_groupby, ga, gb), width="stretch")
+                st.plotly_chart(dotplot_fig(ds, top, de_groupby, ga, gb), width="stretch", key="de_dotplot")
             with p2:
-                st.plotly_chart(heatmap_fig(ds, top, de_groupby, ga, gb), width="stretch")
+                st.plotly_chart(heatmap_fig(ds, top, de_groupby, ga, gb), width="stretch", key="de_heatmap")
 
             st.subheader("View a result gene on the embedding")
             g = st.selectbox("Gene", list(table.index[:200]))
             e1, e2 = st.columns(2)
             with e1:
-                st.plotly_chart(gene_fig(ds, xy, g, labels, point_size), width="stretch")
+                st.plotly_chart(gene_fig(ds, xy, g, labels, point_size), width="stretch", key="de_gene_view")
             with e2:
                 st.plotly_chart(cluster_fig(xy, adata.obs[de_groupby], list(ga)[: len(SERIES)], point_size, height=420),
-                                width="stretch")
+                                width="stretch", key="de_groups_view")
         else:
             st.info("No genes pass the current filters.")
     else:
