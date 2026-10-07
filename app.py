@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import anndata as ad
@@ -8,64 +9,77 @@ import scanpy as sc
 import scipy.sparse as sp
 import streamlit as st
 
-st.set_page_config(page_title="Bone Marrow Stroma Explorer", layout="wide")
+from datasets import DATASETS
 
-DATA = Path(__file__).parent / "data" / "stroma.h5ad"
-EMBEDDINGS = {"UMAP": "X_umap", "tSNE (authors)": "X_tsne"}
+st.set_page_config(page_title="Bone Marrow Niche Explorer", layout="wide")
+
+DATA_DIR = Path(__file__).parent / "data"
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 MUTED = "#b4b2ad"
 SEQ = [[0, "#cde2fb"], [0.35, "#6da7ec"], [0.7, "#256abf"], [1, "#0d366b"]]
 DIVERGING = [[0, "#2a78d6"], [0.5, "#f0efec"], [1, "#e34948"]]
 UP, DOWN = "#e34948", "#2a78d6"
-PSEUDOCOUNT = 0.01  # on linear (TP4K) means; keeps fold changes finite for genes absent in one group
+PSEUDOCOUNT = 0.01  # on linear-scale means; keeps fold changes finite for genes absent in one group
 
 
-@st.cache_resource(show_spinner="Loading dataset…")
-def load():
-    adata = sc.read_h5ad(DATA)
-    X = adata.X.tocsr()
+def dataset_files(name):
+    base = DATASETS[name]["file"]
+    single = DATA_DIR / f"{base}.h5ad"
+    if single.exists():
+        return [single]
+    parts = DATA_DIR.glob(f"{base}.part*of*.h5ad")
+    return sorted(parts, key=lambda p: int(re.search(r"\.part(\d+)of", p.name).group(1)))
+
+
+@st.cache_resource(max_entries=1, show_spinner="Loading dataset…")
+def load(name):
+    parts = [sc.read_h5ad(p) for p in dataset_files(name)]
+    X = parts[0].X if len(parts) == 1 else sp.vstack([p.X for p in parts], format="csr")
+    obs = pd.concat([p.obs for p in parts])
+    obsm = {k: np.concatenate([p.obsm[k] for p in parts]) for k in parts[0].obsm}
+    var = parts[0].var
+    del parts
+    # Kept row-compressed: converting the 32k-cell atlas to CSC would add ~0.7 GB at load.
+    X = X.astype(np.float32, copy=False)
+    adata = ad.AnnData(X=X, obs=obs, var=var, obsm=obsm)
     return {
         "adata": adata,
         "X": X,
-        "Xc": X.tocsc(),
         "genes": adata.var_names.to_numpy(),
         "gene_lookup": {g.lower(): g for g in adata.var_names},
         "gene_index": {g: i for i, g in enumerate(adata.var_names)},
     }
 
 
-@st.cache_resource(show_spinner="Summarizing groups…")
-def group_stats(groupby):
+@st.cache_resource(max_entries=8, show_spinner="Summarizing groups…")
+def group_stats(name, groupby):
     """Per-group sums of log and linear expression and detection counts (groups x genes)."""
-    d = load()
+    d = load(name)
     labels = d["adata"].obs[groupby]
     groups = list(labels.cat.categories)
     G = sp.csr_matrix(
-        (np.ones(len(labels)), (labels.cat.codes.to_numpy(), np.arange(len(labels)))),
+        (np.ones(len(labels), dtype=np.float32), (labels.cat.codes.to_numpy(), np.arange(len(labels)))),
         shape=(len(groups), len(labels)),
     )
     X = d["X"]
-    Xlin = X.copy()
-    Xlin.data = np.expm1(Xlin.data)
-    Xbin = X.copy()
-    Xbin.data = np.ones_like(Xbin.data)
+    same_pattern = lambda data: sp.csr_matrix((data, X.indices, X.indptr), shape=X.shape)
     as_df = lambda m: pd.DataFrame(np.asarray(m.todense()), index=groups, columns=d["genes"])
     return {
         "n": pd.Series(np.asarray(G.sum(1)).ravel(), index=groups),
         "sum_log": as_df(G @ X),
-        "sum_lin": as_df(G @ Xlin),
-        "n_detected": as_df(G @ Xbin),
+        "sum_lin": as_df(G @ same_pattern(np.expm1(X.data))),
+        "n_detected": as_df(G @ same_pattern(np.ones_like(X.data))),
     }
 
 
 @st.cache_data(max_entries=20, show_spinner=False)
-def run_de(groupby, group_a, group_b, method):
-    d = load()
+def run_de(name, groupby, group_a, group_b, method):
+    d = load(name)
     labels = d["adata"].obs[groupby]
     in_a, in_b = labels.isin(group_a).to_numpy(), labels.isin(group_b).to_numpy()
     keep = in_a | in_b
     sub = ad.AnnData(
-        X=d["X"][keep],
+        X=d["X"] if keep.all() else d["X"][keep],
         obs=pd.DataFrame({"g": pd.Categorical(np.where(in_a[keep], "A", "B"))}),
         var=pd.DataFrame(index=d["genes"]),
     )
@@ -73,7 +87,7 @@ def run_de(groupby, group_a, group_b, method):
     sc.tl.rank_genes_groups(sub, "g", groups=["A"], reference="B", method=method, **kwargs)
     res = sc.get.rank_genes_groups_df(sub, "A").set_index("names").reindex(d["genes"])
 
-    s = group_stats(groupby)
+    s = group_stats(name, groupby)
     a, b = list(group_a), list(group_b)
     n_a, n_b = s["n"][a].sum(), s["n"][b].sum()
     mean_a = s["sum_lin"].loc[a].sum() / n_a
@@ -97,17 +111,17 @@ def run_de(groupby, group_a, group_b, method):
     return out, int(n_a), int(n_b)
 
 
-def parse_genes(text):
-    lookup = load()["gene_lookup"]
+def parse_genes(name, text):
+    lookup = load(name)["gene_lookup"]
     tokens = [t for t in text.replace(",", " ").replace(";", " ").split() if t]
     found = [lookup[t.lower()] for t in tokens if t.lower() in lookup]
     missing = [t for t in tokens if t.lower() not in lookup]
     return list(dict.fromkeys(found)), missing
 
 
-def gene_vector(gene):
-    d = load()
-    return d["Xc"][:, d["gene_index"][gene]].toarray().ravel()
+def gene_vector(name, gene):
+    d = load(name)
+    return d["X"][:, d["gene_index"][gene]].toarray().ravel()
 
 
 def base_embedding_fig(title, height):
@@ -147,8 +161,8 @@ def cluster_fig(xy, labels, highlight, point_size, height=520):
     return fig
 
 
-def gene_fig(xy, gene, labels, point_size, height=420):
-    vals = gene_vector(gene)
+def gene_fig(name, xy, gene, labels, point_size, height=420):
+    vals = gene_vector(name, gene)
     fig = base_embedding_fig(gene, height)
     zero = vals == 0
     fig.add_trace(go.Scattergl(
@@ -172,8 +186,8 @@ def gene_fig(xy, gene, labels, point_size, height=420):
     return fig
 
 
-def dotplot_fig(genes, groupby, mark_a=(), mark_b=()):
-    s = group_stats(groupby)
+def dotplot_fig(name, genes, groupby, mark_a=(), mark_b=()):
+    s = group_stats(name, groupby)
     groups = list(s["n"].index)
     mean_log = s["sum_log"][genes].div(s["n"], axis=0)
     pct = s["n_detected"][genes].div(s["n"], axis=0) * 100
@@ -204,8 +218,8 @@ def dotplot_fig(genes, groupby, mark_a=(), mark_b=()):
     return fig
 
 
-def heatmap_fig(genes, groupby, mark_a=(), mark_b=()):
-    s = group_stats(groupby)
+def heatmap_fig(name, genes, groupby, mark_a=(), mark_b=()):
+    s = group_stats(name, groupby)
     mean_log = s["sum_log"][genes].div(s["n"], axis=0)
     z = (mean_log - mean_log.mean()) / mean_log.std().replace(0, 1)
     tag = lambda g: f"{g} (A)" if g in mark_a else (f"{g} (B)" if g in mark_b else str(g))
@@ -259,39 +273,44 @@ def volcano_fig(df, up, down, padj_max, lfc_min, label_genes):
 
 
 # ---------------------------------------------------------------- layout
-d = load()
-adata = d["adata"]
-
 with st.sidebar:
     st.header("Settings")
-    embedding = st.radio("Embedding", list(EMBEDDINGS), help="UMAP was computed for this app; tSNE is from the original authors.")
-    groupby = st.radio("Group cells by", ["Cluster", "Subcluster"],
-                       help="Subclusters split clusters 1, 7, 8 and 12 into finer populations.")
+    ds = st.selectbox("Dataset", list(DATASETS), key="dataset")
+    spec = DATASETS[ds]
+    if st.session_state.get("_loaded") not in (None, ds):
+        load.clear()  # drop the previous dataset before loading the next, so both never sit in memory
+    st.session_state["_loaded"] = ds
+    d = load(ds)
+    adata = d["adata"]
+    embedding = st.radio("Embedding", list(spec["embeddings"]), key=f"emb_{ds}")
+    groupby = st.radio("Group cells by", spec["groupings"], key=f"grp_{ds}", help=spec.get("grouping_help"))
     point_size = st.slider("Point size", 1, 6, 3)
     st.caption(f"{adata.n_obs:,} cells · {adata.n_vars:,} genes (detected in ≥3 cells)")
 
-xy = adata.obsm[EMBEDDINGS[embedding]]
+xy = adata.obsm[spec["embeddings"][embedding]]
 labels = adata.obs[groupby]
 all_groups = list(labels.cat.categories)
+units = spec["units"]
 
-st.title("Mouse Bone Marrow Stroma in Homeostasis")
+st.title(spec["title"])
 tab_genes, tab_de, tab_about = st.tabs(["Gene explorer", "Differential expression", "About"])
 
 with tab_genes:
     c1, c2 = st.columns([2, 1])
     with c1:
-        picked = st.multiselect("Genes", d["genes"], default=["Lepr", "Cxcl12", "Kitl", "Vcam1"],
+        picked = st.multiselect("Genes", d["genes"], key=f"genes_{ds}",
+                                default=[g for g in spec["default_genes"] if g in d["gene_index"]],
                                 placeholder="Type to search…")
     with c2:
-        pasted = st.text_input("…or paste a list", placeholder="Fgf7, Fgf18, Ntn1")
-    extra, missing = parse_genes(pasted)
+        pasted = st.text_input("…or paste a list", placeholder="Fgf7, Fgf18, Ntn1", key=f"paste_{ds}")
+    extra, missing = parse_genes(ds, pasted)
     if missing:
         st.warning(f"Not found (or detected in <3 cells): {', '.join(missing)}")
     genes = list(dict.fromkeys(picked + extra))
 
     highlight = st.multiselect(
-        f"Highlight up to {len(SERIES)} {groupby.lower()}s (others shown in gray, all are labeled)",
-        all_groups, default=all_groups[: len(SERIES)], max_selections=len(SERIES),
+        f"Highlight up to {len(SERIES)} groups (others shown in gray, all are labeled)",
+        all_groups, default=all_groups[: len(SERIES)], max_selections=len(SERIES), key=f"hl_{ds}_{groupby}",
     )
     st.plotly_chart(cluster_fig(xy, labels, highlight, point_size), width="stretch")
 
@@ -299,22 +318,25 @@ with tab_genes:
         cols = st.columns(2)
         for i, g in enumerate(genes):
             with cols[i % 2]:
-                st.plotly_chart(gene_fig(xy, g, labels, point_size), width="stretch")
+                st.plotly_chart(gene_fig(ds, xy, g, labels, point_size), width="stretch")
         st.subheader(f"Expression by {groupby.lower()}")
-        st.plotly_chart(dotplot_fig(genes, groupby), width="stretch")
+        st.plotly_chart(dotplot_fig(ds, genes, groupby), width="stretch")
     else:
         st.info("Pick or paste genes to plot their expression.")
 
 with tab_de:
-    st.markdown(f"Compare group **A** against group **B** (each a set of {groupby.lower()}s).")
-    with st.form("de_form"):
+    st.markdown(f"Compare group **A** against group **B** (each a set of {groupby.lower()} groups).")
+    default_a = spec.get("default_group_a", {}).get(groupby)
+    with st.form(f"de_form_{ds}_{groupby}"):
         c1, c2 = st.columns(2)
         with c1:
-            group_a = st.multiselect("Group A", all_groups, default=[all_groups[1]])
+            group_a = st.multiselect("Group A", all_groups, key=f"ga_{ds}_{groupby}",
+                                     default=[default_a] if default_a in all_groups else all_groups[:1])
         with c2:
-            b_mode = st.radio("Group B", ["All other cells", "Choose groups"], horizontal=True)
-            group_b_pick = st.multiselect("Group B groups (used when 'Choose groups' is selected)", all_groups)
-        method = st.selectbox("Test", ["wilcoxon", "t-test"],
+            b_mode = st.radio("Group B", ["All other cells", "Choose groups"], horizontal=True, key=f"bm_{ds}_{groupby}")
+            group_b_pick = st.multiselect("Group B groups (used when 'Choose groups' is selected)", all_groups,
+                                          key=f"gb_{ds}_{groupby}")
+        method = st.selectbox("Test", ["wilcoxon", "t-test"], key=f"test_{ds}_{groupby}",
                               help="Wilcoxon rank-sum is the standard for scRNA-seq; t-test is faster.")
         submitted = st.form_submit_button("Run differential expression", type="primary")
 
@@ -322,15 +344,15 @@ with tab_de:
         group_b = [g for g in all_groups if g not in group_a] if b_mode == "All other cells" else group_b_pick
         overlap = set(group_a) & set(group_b)
         if not group_a or not group_b:
-            st.error("Both groups need at least one cluster.")
+            st.error("Both groups need at least one group selected.")
         elif overlap:
             st.error(f"Groups overlap: {', '.join(sorted(overlap))}")
         else:
-            st.session_state["de_args"] = (groupby, tuple(group_a), tuple(group_b), method)
+            st.session_state[f"de_args_{ds}"] = (ds, groupby, tuple(group_a), tuple(group_b), method)
 
-    args = st.session_state.get("de_args")
+    args = st.session_state.get(f"de_args_{ds}")
     if args:
-        de_groupby, ga, gb, de_method = args
+        _, de_groupby, ga, gb, de_method = args
         with st.spinner("Running test across all genes… (Wilcoxon on large groups can take ~30–60 s)"):
             df, n_a, n_b = run_de(*args)
         st.success(f"{de_method} · A = {de_groupby} {', '.join(ga)} ({n_a:,} cells) vs "
@@ -395,14 +417,16 @@ with tab_de:
                     "padj": st.column_config.NumberColumn(format="%.1e"),
                     "pct_A": st.column_config.NumberColumn("% A", format="%.1f"),
                     "pct_B": st.column_config.NumberColumn("% B", format="%.1f"),
-                    "mean_A": st.column_config.NumberColumn("mean A (TP4K)", format="%.2f"),
-                    "mean_B": st.column_config.NumberColumn("mean B (TP4K)", format="%.2f"),
+                    "mean_A": st.column_config.NumberColumn(f"mean A ({units})", format="%.2f"),
+                    "mean_B": st.column_config.NumberColumn(f"mean B ({units})", format="%.2f"),
                     "specificity": st.column_config.NumberColumn(format="%.2f"),
                 },
             )
+            safe = lambda groups: re.sub(r"[^A-Za-z0-9_.-]+", "", "-".join(groups))
             st.download_button(
                 "Download filtered table (CSV)", table.to_csv().encode(),
-                file_name=f"DE_{de_groupby}_{'-'.join(ga)}_vs_{'-'.join(gb) if len(gb) <= 6 else 'rest'}.csv",
+                file_name=f"DE_{ds.replace(' ', '_')}_{safe([de_groupby])}_{safe(ga)}_vs_"
+                          f"{safe(gb) if len(gb) <= 6 else 'rest'}.csv",
                 mime="text/csv",
             )
 
@@ -410,15 +434,15 @@ with tab_de:
             st.subheader("Top genes across all groups")
             p1, p2 = st.columns(2)
             with p1:
-                st.plotly_chart(dotplot_fig(top, de_groupby, ga, gb), width="stretch")
+                st.plotly_chart(dotplot_fig(ds, top, de_groupby, ga, gb), width="stretch")
             with p2:
-                st.plotly_chart(heatmap_fig(top, de_groupby, ga, gb), width="stretch")
+                st.plotly_chart(heatmap_fig(ds, top, de_groupby, ga, gb), width="stretch")
 
             st.subheader("View a result gene on the embedding")
             g = st.selectbox("Gene", list(table.index[:200]))
             e1, e2 = st.columns(2)
             with e1:
-                st.plotly_chart(gene_fig(xy, g, labels, point_size), width="stretch")
+                st.plotly_chart(gene_fig(ds, xy, g, labels, point_size), width="stretch")
             with e2:
                 st.plotly_chart(cluster_fig(xy, adata.obs[de_groupby], list(ga)[: len(SERIES)], point_size, height=420),
                                 width="stretch")
@@ -428,19 +452,16 @@ with tab_de:
         st.info("Choose groups and press **Run differential expression**.")
 
 with tab_about:
+    st.markdown(spec["about"])
     st.markdown(f"""
-**Data:** Broad Single Cell Portal study SCP361, *Mouse Bone Marrow Stroma in Homeostasis*.
-Expression values are the authors' log-normalized TP4K matrix; cluster and subcluster labels and the
-tSNE are the authors'. The UMAP was computed for this app (2,000 highly variable genes, 40 PCs, 15 neighbors).
-
 **Statistics:** p-values come from scanpy's `rank_genes_groups` (Wilcoxon rank-sum with tie correction,
-or Welch t-test) with Benjamini–Hochberg correction. Fold changes are computed from linear-scale group means
-with a pseudocount of {PSEUDOCOUNT}, so genes absent from one group get large but finite values.
+or Welch t-test) with Benjamini–Hochberg correction. Fold changes are computed from linear-scale ({units})
+group means with a pseudocount of {PSEUDOCOUNT}, so genes absent from one group get large but finite values.
 
 **Specificity margin:** for genes up in A, log2(mean A / mean of the highest single B group); for genes
 down in A, log2(mean of the lowest single B group / mean A). A positive value means A differs from
 *every* B group in that direction, not only from the pooled B average.
 
-Note: with tens of thousands of cells, almost any consistent difference is "significant"; rank by effect size or
+Note: with thousands of cells, almost any consistent difference is "significant"; rank by effect size or
 specificity and use the detection filters to find useful markers.
 """)
